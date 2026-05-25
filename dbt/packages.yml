@@ -1,0 +1,12 @@
+packages:
+  # Macros utilitários (date_spine, generate_surrogate_key, etc.)
+  - package: dbt-labs/dbt_utils
+    version: [">=1.1.0", "<2.0.0"]
+
+  # Testes de qualidade avançados (expression_is_true, not_accepted_values, etc.)
+  - package: calogica/dbt_expectations
+    version: [">=0.10.0", "<1.0.0"]
+
+  # Testes de auditoria: compara contagens de linhas entre runs
+  - package: dbt-labs/audit_helper
+    version: [">=0.9.0", "<1.0.0"]
