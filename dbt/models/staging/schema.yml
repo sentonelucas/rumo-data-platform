@@ -1,0 +1,83 @@
+version: 2
+
+sources:
+  - name: rumo_silver
+    description: "Camada silver do Data Lake (Apache Iceberg via Redshift Spectrum)"
+    database: rumo_dw
+    schema: rumo_silver_spectrum
+    freshness:
+      warn_after: {count: 12, period: hour}
+      error_after: {count: 25, period: hour}   # Alerta se D-1 não chegou
+    loaded_at_field: _silver_processed_at
+    tables:
+      - name: fato_eventos_ferroviarios
+        description: "Eventos ferroviários processados com regras de negócio"
+      - name: vagoes
+        description: "Cadastro de vagões"
+      - name: contratos
+        description: "Contratos com clientes"
+
+models:
+  - name: stg_eventos_ferroviarios
+    description: >
+      Staging de eventos ferroviários. Renomeia colunas, faz cast de tipos
+      e remove registros com chave primária nula. NÃO aplica regras de negócio.
+    columns:
+      - name: evento_id
+        description: "Identificador único do evento (natural key do SQL Server)"
+        tests:
+          - not_null
+          - unique
+
+      - name: vagao_id
+        description: "FK para dim_vagoes"
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_vagoes')
+              field: vagao_id
+              severity: warn    # warn (não error) pois vagão pode ser novo
+
+      - name: status_evento
+        description: "Status normalizado do evento ferroviário"
+        tests:
+          - not_null
+          - accepted_values:
+              values:
+                - 'EM_TRANSITO'
+                - 'PARADO'
+                - 'CHEGOU'
+                - 'SAIU'
+                - 'MANUTENCAO'
+                - 'CARREGANDO'
+                - 'DESCARREGANDO'
+
+      - name: iniciado_em
+        description: "Timestamp de início do evento"
+        tests:
+          - not_null
+
+      - name: duracao_minutos
+        description: "Duração do evento em minutos"
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+              max_value: 43200   # máximo 30 dias em minutos
+
+      - name: sla_violado
+        description: "true se duração real > SLA contratado"
+        tests:
+          - not_null
+
+  - name: stg_vagoes
+    description: "Staging de vagões — cadastro ativo"
+    columns:
+      - name: vagao_id
+        tests:
+          - not_null
+          - unique
+      - name: capacidade_ton
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 1
+              max_value: 200
