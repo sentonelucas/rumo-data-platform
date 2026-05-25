@@ -1,0 +1,55 @@
+name: 'rumo_data_platform'
+version: '1.0.0'
+config-version: 2
+
+profile: 'rumo_redshift'
+
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+# Configurações globais de materialização por camada
+models:
+  rumo_data_platform:
+
+    # Staging: views leves sobre o silver (Iceberg via Spectrum)
+    staging:
+      +materialized: view
+      +schema: staging
+      +tags: ["staging"]
+      +docs:
+        node_color: "#0D6E8A"  # teal
+
+    # Intermediate: transformações intermediárias, não expostas ao BI
+    intermediate:
+      +materialized: ephemeral
+      +schema: intermediate
+      +tags: ["intermediate"]
+
+    # Marts: tabelas finais expostas ao BI — Redshift colunar
+    marts:
+      +materialized: incremental
+      +schema: marts
+      +tags: ["marts", "gold"]
+      +docs:
+        node_color: "#B8860B"  # gold
+
+      # Configuração específica para tabelas críticas
+      core:
+        +materialized: table
+        +post-hook:
+          - "GRANT SELECT ON {{ this }} TO GROUP bi_readers"
+          - "ANALYZE {{ this }}"
+
+# Vars globais (sobrescritas por ambiente via --vars ou profiles.yml)
+vars:
+  start_date: '2020-01-01'
+  incremental_lookback_days: 3   # Reprocessa últimos 3 dias para garantir idempotência
+  sla_horas_padrao: 24            # SLA default para contratos sem SLA explícito
