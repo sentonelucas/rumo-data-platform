@@ -1,0 +1,233 @@
+# .github/workflows/deploy.yml
+# Pipeline de Deploy — executa ao fazer merge na branch main
+#
+# Etapas:
+#   1. Deploy dos Glue Jobs no S3 (scripts) + atualização via API
+#   2. Sync dos DAGs no bucket do MWAA
+#   3. dbt run + dbt test em produção
+#   4. Notificação no Slack
+
+name: Deploy — Production
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'glue_jobs/**'
+      - 'airflow/dags/**'
+      - 'dbt/**'
+      - 'lambda/**'
+      - 'terraform/**'
+
+env:
+  AWS_REGION: "us-east-1"
+  PYTHON_VERSION: "3.11"
+  GLUE_SCRIPTS_BUCKET: "rumo-glue-scripts-prod"
+  MWAA_DAGS_BUCKET: "rumo-mwaa-dags-prod"
+  MWAA_ENV_NAME: "rumo-data-platform-prod"
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────
+  # JOB 1: Deploy Glue Jobs
+  # ─────────────────────────────────────────────────────────────────────
+  deploy-glue:
+    name: "Deploy Glue Job Scripts"
+    runs-on: ubuntu-latest
+    if: contains(github.event.head_commit.modified, 'glue_jobs/')
+
+    permissions:
+      id-token: write   # Para OIDC (sem AWS keys hardcoded)
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC — sem secret keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsDeployRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload Glue scripts to S3
+        run: |
+          aws s3 sync glue_jobs/ \
+            s3://${{ env.GLUE_SCRIPTS_BUCKET }}/scripts/ \
+            --exclude "*.pyc" \
+            --exclude "__pycache__/*" \
+            --delete
+
+          echo "Glue scripts deployed:"
+          aws s3 ls s3://${{ env.GLUE_SCRIPTS_BUCKET }}/scripts/ --human-readable
+
+      - name: Update Glue Job script paths (if changed)
+        run: |
+          for job_file in glue_jobs/*.py; do
+            job_name="rumo-$(basename $job_file .py | tr '_' '-')"
+            script_s3="s3://${{ env.GLUE_SCRIPTS_BUCKET }}/scripts/$(basename $job_file)"
+
+            # Atualiza path do script no job existente
+            aws glue update-job \
+              --job-name "$job_name" \
+              --job-update "Command={ScriptLocation=$script_s3}" \
+              2>/dev/null && echo "Updated: $job_name" || echo "Skipped (job not found): $job_name"
+          done
+
+  # ─────────────────────────────────────────────────────────────────────
+  # JOB 2: Deploy DAGs no MWAA
+  # ─────────────────────────────────────────────────────────────────────
+  deploy-dags:
+    name: "Deploy Airflow DAGs"
+    runs-on: ubuntu-latest
+    if: contains(github.event.head_commit.modified, 'airflow/dags/')
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsDeployRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Sync DAGs to MWAA S3 bucket
+        run: |
+          aws s3 sync airflow/dags/ \
+            s3://${{ env.MWAA_DAGS_BUCKET }}/dags/ \
+            --exclude "*.pyc" \
+            --exclude "__pycache__/*" \
+            --delete
+
+          echo "DAGs deployed:"
+          aws s3 ls s3://${{ env.MWAA_DAGS_BUCKET }}/dags/ --human-readable
+
+      - name: Wait for MWAA to reload DAGs
+        run: |
+          echo "Aguardando MWAA processar novos DAGs (30s)..."
+          sleep 30
+
+          # Verifica se os DAGs estão saudáveis
+          IMPORT_ERRORS=$(aws mwaa get-environment \
+            --name ${{ env.MWAA_ENV_NAME }} \
+            --query 'Environment.LastUpdate.Error.ErrorMessage' \
+            --output text 2>/dev/null || echo "None")
+
+          if [ "$IMPORT_ERRORS" != "None" ] && [ -n "$IMPORT_ERRORS" ]; then
+            echo "MWAA import errors detected: $IMPORT_ERRORS"
+            exit 1
+          fi
+
+          echo "DAGs loaded successfully."
+
+  # ─────────────────────────────────────────────────────────────────────
+  # JOB 3: dbt Run + Test em Produção
+  # ─────────────────────────────────────────────────────────────────────
+  dbt-deploy:
+    name: "dbt Run + Test (Production)"
+    runs-on: ubuntu-latest
+    if: contains(github.event.head_commit.modified, 'dbt/')
+    needs: [deploy-glue]   # Garante que Glue processou antes do dbt
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dbt
+        run: pip install dbt-redshift==1.8.0
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsDeployRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Retrieve Redshift credentials from Secrets Manager
+        id: secrets
+        run: |
+          SECRET=$(aws secretsmanager get-secret-value \
+            --secret-id "rumo/redshift/dbt-prod" \
+            --query SecretString --output text)
+          echo "REDSHIFT_HOST=$(echo $SECRET | python3 -c 'import sys,json; print(json.load(sys.stdin)[\"host\"])')" >> $GITHUB_ENV
+          echo "REDSHIFT_USER=$(echo $SECRET | python3 -c 'import sys,json; print(json.load(sys.stdin)[\"user\"])')" >> $GITHUB_ENV
+          echo "REDSHIFT_PASSWORD=$(echo $SECRET | python3 -c 'import sys,json; print(json.load(sys.stdin)[\"password\"])')" >> $GITHUB_ENV
+
+      - name: dbt deps
+        working-directory: dbt/
+        run: dbt deps
+
+      - name: dbt run (only changed models + downstream)
+        working-directory: dbt/
+        run: |
+          dbt run \
+            --target prod \
+            --profiles-dir . \
+            --select state:modified+ \
+            --defer \
+            --state target/
+        env:
+          DBT_TARGET: prod
+
+      - name: dbt test (only changed models)
+        working-directory: dbt/
+        run: |
+          dbt test \
+            --target prod \
+            --profiles-dir . \
+            --select state:modified+ \
+            --defer \
+            --state target/
+        env:
+          DBT_TARGET: prod
+
+      - name: dbt docs generate + upload to S3
+        working-directory: dbt/
+        run: |
+          dbt docs generate --target prod --profiles-dir .
+          aws s3 sync target/ s3://${{ env.GLUE_SCRIPTS_BUCKET }}/dbt-docs/ \
+            --include "*.json" --include "*.html"
+          echo "dbt docs available at: https://${{ env.GLUE_SCRIPTS_BUCKET }}.s3.amazonaws.com/dbt-docs/index.html"
+        env:
+          DBT_TARGET: prod
+
+  # ─────────────────────────────────────────────────────────────────────
+  # JOB 4: Notificação no Slack
+  # ─────────────────────────────────────────────────────────────────────
+  notify:
+    name: "Notify Slack"
+    runs-on: ubuntu-latest
+    needs: [deploy-glue, deploy-dags, dbt-deploy]
+    if: always()
+
+    steps:
+      - name: Notify success
+        if: ${{ !contains(needs.*.result, 'failure') }}
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "Deploy Rumo Data Platform concluido com sucesso.\nCommit: ${{ github.sha }}\nAutor: ${{ github.actor }}\nBranch: ${{ github.ref_name }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Notify failure
+        if: ${{ contains(needs.*.result, 'failure') }}
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "FALHA no deploy da Rumo Data Platform.\nCommit: ${{ github.sha }}\nAutor: ${{ github.actor }}\nVerifique: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
