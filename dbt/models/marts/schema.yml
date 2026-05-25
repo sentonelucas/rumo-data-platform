@@ -1,0 +1,67 @@
+version: 2
+
+models:
+  - name: fct_eventos_ferroviarios
+    description: >
+      Tabela fato principal. Eventos ferroviários com surrogate keys,
+      métricas derivadas (% SLA utilizado, parada crítica) e atributos
+      desnormalizados para performance de queries BI.
+      Materialização incremental — merge por evento_id.
+    columns:
+      - name: evento_sk
+        description: "Surrogate key (MD5 do evento_id)"
+        tests:
+          - not_null
+          - unique
+
+      - name: evento_id
+        description: "Natural key do sistema de origem (SQL Server)"
+        tests:
+          - not_null
+
+      - name: status_evento
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['EM_TRANSITO','PARADO','CHEGOU','SAIU','MANUTENCAO','CARREGANDO','DESCARREGANDO']
+
+      - name: duracao_minutos
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+              max_value: 43200
+              row_condition: "duracao_minutos is not null"
+
+      - name: pct_sla_utilizado
+        description: "% do SLA contratado consumido. >100 = violação."
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+              max_value: 10000   # até 100x o SLA em casos extremos
+              row_condition: "pct_sla_utilizado is not null"
+
+      - name: data_particao
+        tests:
+          - not_null
+
+      - name: dbt_updated_at
+        description: "Timestamp da última execução dbt que tocou este registro"
+        tests:
+          - not_null
+
+  - name: mart_sla_violations
+    description: >
+      Mart analítico de violações de SLA. Agregado diário por cliente + segmento.
+      Consumido pelo QuickSight e relatórios operacionais.
+      Janela padrão: últimos 90 dias.
+    columns:
+      - name: data_particao
+        tests: [not_null]
+      - name: cliente_nome
+        tests: [not_null]
+      - name: taxa_violacao_pct
+        description: "% de eventos que violaram SLA no dia"
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+              max_value: 100
