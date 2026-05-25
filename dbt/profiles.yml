@@ -1,0 +1,50 @@
+# profiles.yml
+# Não versionar credenciais — use variáveis de ambiente ou AWS Secrets Manager.
+# Em CI/CD, injetar via GitHub Secrets.
+# Em produção, MWAA injeta via Connections do Airflow.
+
+rumo_redshift:
+  target: prod
+  outputs:
+
+    # Ambiente de desenvolvimento local
+    dev:
+      type: redshift
+      host: "{{ env_var('REDSHIFT_HOST') }}"
+      user: "{{ env_var('REDSHIFT_USER') }}"
+      password: "{{ env_var('REDSHIFT_PASSWORD') }}"
+      port: 5439
+      dbname: rumo_dw
+      schema: dbt_dev_{{ env_var('DBT_USER', 'local') }}  # schema isolado por dev
+      threads: 4
+      keepalives_idle: 240
+      connect_timeout: 10
+      ra3_node: true       # Habilita Redshift Spectrum para ler do S3/Iceberg
+      search_path: "dbt_dev_{{ env_var('DBT_USER', 'local') }},rumo_silver_spectrum,public"
+
+    # Ambiente de CI (GitHub Actions)
+    ci:
+      type: redshift
+      host: "{{ env_var('REDSHIFT_HOST') }}"
+      user: "{{ env_var('REDSHIFT_USER') }}"
+      password: "{{ env_var('REDSHIFT_PASSWORD') }}"
+      port: 5439
+      dbname: rumo_dw
+      schema: "dbt_ci_{{ env_var('GITHUB_RUN_ID', 'test') }}"  # schema único por run
+      threads: 8
+      keepalives_idle: 240
+      ra3_node: true
+
+    # Ambiente de produção
+    prod:
+      type: redshift
+      host: "{{ env_var('REDSHIFT_HOST') }}"
+      user: "{{ env_var('REDSHIFT_USER') }}"
+      password: "{{ env_var('REDSHIFT_PASSWORD') }}"
+      port: 5439
+      dbname: rumo_dw
+      schema: marts
+      threads: 16
+      keepalives_idle: 240
+      ra3_node: true
+      search_path: "marts,rumo_silver_spectrum,public"
